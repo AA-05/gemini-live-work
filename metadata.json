@@ -1,0 +1,9 @@
+{
+  "name": "Gemini Live",
+  "description": "Interactive real-time voice and vision assistant replica powered by the Gemini Live API with low-latency bidirectional audio, camera feed, and live transcriptions.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
