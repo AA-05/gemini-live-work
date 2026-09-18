@@ -20,6 +20,7 @@ app.get("/api/health", (req, res) => {
 app.get("/api/config", (req, res) => {
   res.json({
     hasApiKey: !!process.env.GEMINI_API_KEY,
+    apiKey: process.env.GEMINI_API_KEY || null,
     models: [
       { id: "gemini-3.8-live", name: "Gemini 3.8 Live (Default Audio & Vision)", default: true },
       { id: "gemini-3.8-live-extended-thinking", name: "Gemini 3.8 Live Extended Thinking (Deep Reasoning)" },

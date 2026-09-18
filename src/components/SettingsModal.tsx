@@ -1,5 +1,5 @@
-import React from "react";
-import { X, Volume2, Cpu, FileText, Sliders, Check, Radio } from "lucide-react";
+import React, { useState, useEffect } from "react";
+import { X, Volume2, Cpu, FileText, Sliders, Check, Key, Shield, Globe, Zap, Eye, EyeOff } from "lucide-react";
 import { GeminiLiveModel, GeminiVoice, LiveSessionConfig } from "../types";
 
 interface SettingsModalProps {
@@ -8,6 +8,11 @@ interface SettingsModalProps {
   config: LiveSessionConfig;
   onSaveConfig: (newConfig: LiveSessionConfig) => void;
   isConnected: boolean;
+  apiKey?: string;
+  onSaveApiKey?: (key: string) => void;
+  connectionMode?: "direct" | "proxy";
+  onSaveConnectionMode?: (mode: "direct" | "proxy") => void;
+  isVercel?: boolean;
 }
 
 const VOICE_OPTIONS: { id: GeminiVoice; name: string; description: string }[] = [
@@ -68,24 +73,36 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   config,
   onSaveConfig,
   isConnected,
+  apiKey = "",
+  onSaveApiKey,
+  connectionMode = "direct",
+  onSaveConnectionMode,
+  isVercel = false,
 }) => {
-  const [draft, setDraft] = React.useState<LiveSessionConfig>(config);
+  const [draft, setDraft] = useState<LiveSessionConfig>(config);
+  const [draftKey, setDraftKey] = useState<string>(apiKey);
+  const [draftMode, setDraftMode] = useState<"direct" | "proxy">(connectionMode);
+  const [showKey, setShowKey] = useState<boolean>(false);
 
-  React.useEffect(() => {
+  useEffect(() => {
     setDraft(config);
-  }, [config, isOpen]);
+    setDraftKey(apiKey);
+    setDraftMode(connectionMode);
+  }, [config, apiKey, connectionMode, isOpen]);
 
   if (!isOpen) return null;
 
   const handleSave = () => {
     onSaveConfig(draft);
+    if (onSaveApiKey) onSaveApiKey(draftKey);
+    if (onSaveConnectionMode) onSaveConnectionMode(draftMode);
     onClose();
   };
 
   return (
     <div
       id="settings-modal-backdrop"
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm animate-fade-in"
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm animate-fade-in"
     >
       <div
         id="settings-modal-card"
@@ -97,7 +114,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <Sliders className="w-5 h-5 text-indigo-400" />
             <div>
               <h2 className="text-base font-semibold text-white">Live Session Settings</h2>
-              <p className="text-xs text-slate-400">Configure models, prebuilt voices, and persona</p>
+              <p className="text-xs text-slate-400">Configure models, voices, and Vercel connection options</p>
             </div>
           </div>
           <button
@@ -114,9 +131,112 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           {isConnected && (
             <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-200 text-xs flex items-start gap-2">
               <span className="font-semibold">Note:</span>
-              <span>Changes to model or voice will take effect on your next session reconnection.</span>
+              <span>Changes to model, voice, or connection mode will take effect on your next session reconnection.</span>
             </div>
           )}
+
+          {/* Connection Engine / Vercel Readiness */}
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <label className="text-xs font-semibold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+                <Globe className="w-4 h-4 text-sky-400" />
+                Connection Mode & Hosting
+              </label>
+              {isVercel && (
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 font-mono">
+                  Vercel Environment Detected
+                </span>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <button
+                type="button"
+                id="mode-direct-btn"
+                onClick={() => setDraftMode("direct")}
+                className={`flex items-start justify-between p-3.5 rounded-xl border text-left transition-all ${
+                  draftMode === "direct"
+                    ? "bg-sky-500/15 border-sky-500/60 shadow-sm"
+                    : "bg-white/[0.02] border-white/10 hover:bg-white/[0.05]"
+                }`}
+              >
+                <div className="space-y-1 pr-2">
+                  <div className="flex items-center gap-1.5">
+                    <Zap className="w-4 h-4 text-sky-400" />
+                    <span className="text-xs font-semibold text-white">Direct Gemini Live</span>
+                    <span className="text-[9px] px-1.5 py-0.2 rounded bg-sky-500/20 text-sky-300">Vercel Ready</span>
+                  </div>
+                  <p className="text-[11px] text-slate-400">
+                    Connects directly from your browser to Google's official Live servers. Required for Vercel and serverless hosts.
+                  </p>
+                </div>
+                {draftMode === "direct" && (
+                  <div className="p-1 rounded-full bg-sky-500 text-white shrink-0">
+                    <Check className="w-3.5 h-3.5" />
+                  </div>
+                )}
+              </button>
+
+              <button
+                type="button"
+                id="mode-proxy-btn"
+                onClick={() => setDraftMode("proxy")}
+                className={`flex items-start justify-between p-3.5 rounded-xl border text-left transition-all ${
+                  draftMode === "proxy"
+                    ? "bg-indigo-600/15 border-indigo-500/60 shadow-sm"
+                    : "bg-white/[0.02] border-white/10 hover:bg-white/[0.05]"
+                }`}
+              >
+                <div className="space-y-1 pr-2">
+                  <div className="flex items-center gap-1.5">
+                    <Shield className="w-4 h-4 text-indigo-400" />
+                    <span className="text-xs font-semibold text-white">Local Server Proxy</span>
+                    <span className="text-[9px] px-1.5 py-0.2 rounded bg-slate-500/20 text-slate-300">Node only</span>
+                  </div>
+                  <p className="text-[11px] text-slate-400">
+                    Relays through a local Node.js Express server. (Fails on serverless platforms like Vercel).
+                  </p>
+                </div>
+                {draftMode === "proxy" && (
+                  <div className="p-1 rounded-full bg-indigo-500 text-white shrink-0">
+                    <Check className="w-3.5 h-3.5" />
+                  </div>
+                )}
+              </button>
+            </div>
+          </div>
+
+          {/* Gemini API Key Configuration */}
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="text-xs font-semibold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+                <Key className="w-4 h-4 text-amber-400" />
+                Gemini API Key
+              </label>
+              <span className="text-[11px] text-slate-400">Used for direct browser Live session</span>
+            </div>
+
+            <div className="relative">
+              <input
+                id="settings-api-key-input"
+                type={showKey ? "text" : "password"}
+                value={draftKey}
+                onChange={(e) => setDraftKey(e.target.value.trim())}
+                placeholder="AIzaSy..."
+                className="w-full pl-3 pr-10 py-2.5 bg-black/40 border border-white/10 rounded-xl text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 font-mono"
+              />
+              <button
+                type="button"
+                onClick={() => setShowKey(!showKey)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white transition"
+              >
+                {showKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
+            </div>
+            <p className="text-[11px] text-slate-400 mt-1.5">
+              On Vercel, you can also add <code className="text-indigo-300 bg-white/5 px-1 py-0.5 rounded">VITE_GEMINI_API_KEY</code> in your Vercel Project Settings &gt; Environment Variables.
+            </p>
+          </div>
 
           {/* Model Selection */}
           <div>

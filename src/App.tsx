@@ -14,6 +14,12 @@ import { VideoFeed } from "./components/VideoFeed";
 import { SettingsModal } from "./components/SettingsModal";
 import { ToolCallBadge } from "./components/ToolCallBadge";
 import {
+  connectDirectGeminiLive,
+  connectProxyWebSocket,
+  LiveSessionHandle,
+  LiveClientCallbacks,
+} from "./utils/geminiLiveClient";
+import {
   Sparkles,
   AlertCircle,
   Key,
@@ -21,11 +27,41 @@ import {
   Radio,
   ExternalLink,
   Volume2,
+  Globe,
 } from "lucide-react";
 
 export default function App() {
   const [status, setStatus] = useState<LiveStatus>("disconnected");
   const [hasApiKey, setHasApiKey] = useState<boolean>(true);
+  const [backendApiKey, setBackendApiKey] = useState<string>("");
+  const [userApiKey, setUserApiKey] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      return (
+        localStorage.getItem("gemini_live_api_key") ||
+        (import.meta.env.VITE_GEMINI_API_KEY as string) ||
+        ""
+      );
+    }
+    return (import.meta.env.VITE_GEMINI_API_KEY as string) || "";
+  });
+
+  const isVercel =
+    typeof window !== "undefined" &&
+    (window.location.hostname.includes("vercel.app") ||
+      window.location.hostname.includes("vercel"));
+
+  const [connectionMode, setConnectionMode] = useState<"direct" | "proxy">(() => {
+    if (typeof window !== "undefined") {
+      const saved = localStorage.getItem("gemini_live_connection_mode") as
+        | "direct"
+        | "proxy"
+        | null;
+      if (saved) return saved;
+      return "direct"; // Default to direct for Vercel and browser compatibility
+    }
+    return "direct";
+  });
+
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const [activeVideoSource, setActiveVideoSource] = useState<"camera" | "screen" | null>(null);
   const [visualizerMode, setVisualizerMode] = useState<VisualizerMode>("orb");
@@ -47,10 +83,10 @@ export default function App() {
     affectiveDialog: true,
   });
 
-  // Audio system references
+  // Audio & Session references
   const audioPlayerRef = useRef<LiveAudioPlayer | null>(null);
   const audioRecorderRef = useRef<LiveAudioRecorder | null>(null);
-  const socketRef = useRef<WebSocket | null>(null);
+  const sessionHandleRef = useRef<LiveSessionHandle | null>(null);
 
   const [userAnalyser, setUserAnalyser] = useState<AnalyserNode | null>(null);
   const [geminiAnalyser, setGeminiAnalyser] = useState<AnalyserNode | null>(null);
@@ -58,16 +94,26 @@ export default function App() {
   // Check backend config
   useEffect(() => {
     fetch("/api/config")
-      .then((res) => res.json())
+      .then((res) => {
+        if (!res.ok) throw new Error("Backend config endpoint unavailable");
+        return res.json();
+      })
       .then((data) => {
-        setHasApiKey(data.hasApiKey);
+        if (data.apiKey) {
+          setBackendApiKey(data.apiKey);
+        }
+        if (typeof data.hasApiKey === "boolean") {
+          setHasApiKey(data.hasApiKey || !!userApiKey);
+        }
       })
       .catch((err) => {
-        console.warn("Could not check config:", err);
+        // On static hosting like Vercel, /api/config might not exist; fallback to client key
+        console.info("Config fetched on static host / Vercel fallback:", err.message);
+        setHasApiKey(!!userApiKey || !!import.meta.env.VITE_GEMINI_API_KEY);
       });
-  }, []);
+  }, [userApiKey]);
 
-  // Connect to Gemini Live API WebSocket
+  // Connect to Gemini Live session
   const connectSession = useCallback(async () => {
     setErrorMessage(null);
     setStatus("connecting");
@@ -79,197 +125,194 @@ export default function App() {
     audioPlayerRef.current.init();
     setGeminiAnalyser(audioPlayerRef.current.getAnalyser());
 
-    // Connect WebSocket
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${window.location.host}/api/live`;
-    const ws = new WebSocket(wsUrl);
-    socketRef.current = ws;
+    const effectiveKey =
+      userApiKey ||
+      backendApiKey ||
+      (import.meta.env.VITE_GEMINI_API_KEY as string) ||
+      "";
 
-    ws.onopen = async () => {
-      // Send session initialization
-      ws.send(
-        JSON.stringify({
-          type: "init",
-          model: config.model,
-          voice: config.voice,
-          systemInstruction: config.systemInstruction,
-        })
-      );
+    const callbacks: LiveClientCallbacks = {
+      onStatusChange: (newStatus, msg) => {
+        setStatus(newStatus as LiveStatus);
+        if (newStatus === "ready") {
+          setErrorMessage(null);
+        }
+      },
+      onAudioData: (base64Pcm) => {
+        setStatus("speaking");
+        audioPlayerRef.current?.playChunk(base64Pcm);
+      },
+      onModelText: (text) => {
+        setInterimGeminiText((prev) => (prev ? prev + " " + text : text));
+      },
+      onInputTranscription: (text, finished) => {
+        if (finished) {
+          setTranscripts((prev) => [
+            ...prev,
+            {
+              id: String(Date.now()),
+              role: "user",
+              text,
+              timestamp: new Date(),
+            },
+          ]);
+          setInterimUserText("");
+        } else {
+          setInterimUserText(text);
+        }
+      },
+      onInterimTranscription: (text) => {
+        setInterimUserText(text);
+        setStatus((prev) => (prev !== "speaking" ? "listening" : prev));
+      },
+      onOutputTranscription: (text, finished) => {
+        if (finished) {
+          setTranscripts((prev) => [
+            ...prev,
+            {
+              id: String(Date.now()),
+              role: "gemini",
+              text,
+              timestamp: new Date(),
+            },
+          ]);
+          setInterimGeminiText("");
+        } else {
+          setInterimGeminiText(text);
+        }
+      },
+      onInterrupted: () => {
+        audioPlayerRef.current?.interrupt();
+        setStatus("interrupted");
+        setInterimGeminiText("");
+        setTimeout(() => setStatus("ready"), 800);
+      },
+      onTurnComplete: () => {
+        setInterimGeminiText((cur) => {
+          if (cur) {
+            setTranscripts((prev) => [
+              ...prev,
+              {
+                id: String(Date.now()),
+                role: "gemini",
+                text: cur,
+                timestamp: new Date(),
+              },
+            ]);
+          }
+          return "";
+        });
+        setStatus("ready");
+      },
+      onToolCallStarted: (id, name, args) => {
+        setToolCalls((prev) => [
+          ...prev,
+          {
+            id,
+            name,
+            args: args || {},
+            status: "pending",
+            timestamp: new Date(),
+          },
+        ]);
+      },
+      onToolCallCompleted: (id, name, result) => {
+        setToolCalls((prev) =>
+          prev.map((t) => (t.id === id ? { ...t, status: "done", result } : t))
+        );
+        setTranscripts((prev) => [
+          ...prev,
+          {
+            id: String(Date.now()),
+            role: "tool",
+            text: `Invoked ${name}`,
+            toolName: name,
+            toolResult: result,
+            timestamp: new Date(),
+          },
+        ]);
+      },
+      onError: (err) => {
+        console.error("Live session error:", err);
+        setErrorMessage(err);
+        setStatus("error");
+      },
+      onClose: () => {
+        setStatus("disconnected");
+        sessionHandleRef.current = null;
+      },
+    };
 
-      // Start audio recording
+    const startMicRecording = async (handle: LiveSessionHandle) => {
       try {
         if (!audioRecorderRef.current) {
           audioRecorderRef.current = new LiveAudioRecorder();
         }
         await audioRecorderRef.current.start((base64Pcm) => {
-          if (ws.readyState === WebSocket.OPEN && !isMuted) {
-            ws.send(
-              JSON.stringify({
-                type: "audio",
-                data: base64Pcm,
-              })
-            );
+          if (!isMuted) {
+            handle.sendAudio(base64Pcm);
           }
         });
         setUserAnalyser(audioRecorderRef.current.getAnalyser());
       } catch (micErr: any) {
         console.error("Microphone access error:", micErr);
-        setErrorMessage("Microphone access was denied or is unavailable. Please grant microphone permissions.");
+        setErrorMessage(
+          "Microphone access was denied or is unavailable. Please grant microphone permissions."
+        );
       }
     };
 
-    ws.onmessage = (event) => {
+    const tryDirectConnect = async () => {
+      if (!effectiveKey) {
+        setStatus("disconnected");
+        setIsSettingsOpen(true);
+        setErrorMessage(
+          isVercel
+            ? "Gemini API key is required on Vercel. Please enter your API key or set VITE_GEMINI_API_KEY in your Vercel Project Settings."
+            : "Gemini API key is required to start live session. Please enter your API key in Settings."
+        );
+        return;
+      }
       try {
-        const msg = JSON.parse(event.data);
-
-        switch (msg.type) {
-          case "session_ready":
-            setStatus("ready");
-            setErrorMessage(null);
-            break;
-
-          case "audio":
-            setStatus("speaking");
-            audioPlayerRef.current?.playChunk(msg.data);
-            break;
-
-          case "model_text":
-            setInterimGeminiText((prev) => (prev ? prev + " " + msg.text : msg.text));
-            break;
-
-          case "input_transcription":
-            if (msg.finished) {
-              setTranscripts((prev) => [
-                ...prev,
-                {
-                  id: String(Date.now()),
-                  role: "user",
-                  text: msg.text,
-                  timestamp: new Date(),
-                },
-              ]);
-              setInterimUserText("");
-            } else {
-              setInterimUserText(msg.text);
-            }
-            break;
-
-          case "interim_input_transcription":
-            setInterimUserText(msg.text);
-            if (status !== "speaking") {
-              setStatus("listening");
-            }
-            break;
-
-          case "output_transcription":
-            if (msg.finished) {
-              setTranscripts((prev) => [
-                ...prev,
-                {
-                  id: String(Date.now()),
-                  role: "gemini",
-                  text: msg.text,
-                  timestamp: new Date(),
-                },
-              ]);
-              setInterimGeminiText("");
-            } else {
-              setInterimGeminiText(msg.text);
-            }
-            break;
-
-          case "interrupted":
-            audioPlayerRef.current?.interrupt();
-            setStatus("interrupted");
-            setInterimGeminiText("");
-            setTimeout(() => {
-              setStatus("ready");
-            }, 800);
-            break;
-
-          case "turn_complete":
-            if (interimGeminiText) {
-              setTranscripts((prev) => [
-                ...prev,
-                {
-                  id: String(Date.now()),
-                  role: "gemini",
-                  text: interimGeminiText,
-                  timestamp: new Date(),
-                },
-              ]);
-              setInterimGeminiText("");
-            }
-            setStatus("ready");
-            break;
-
-          case "tool_call_started":
-            setToolCalls((prev) => [
-              ...prev,
-              {
-                id: msg.id,
-                name: msg.name,
-                args: msg.args || {},
-                status: "pending",
-                timestamp: new Date(),
-              },
-            ]);
-            break;
-
-          case "tool_call_completed":
-            setToolCalls((prev) =>
-              prev.map((t) =>
-                t.id === msg.id ? { ...t, status: "done", result: msg.result } : t
-              )
-            );
-            setTranscripts((prev) => [
-              ...prev,
-              {
-                id: String(Date.now()),
-                role: "tool",
-                text: `Invoked ${msg.name}`,
-                toolName: msg.name,
-                toolResult: msg.result,
-                timestamp: new Date(),
-              },
-            ]);
-            break;
-
-          case "error":
-            console.error("Live API error received:", msg.error);
-            setErrorMessage(msg.error);
-            setStatus("error");
-            break;
-
-          case "session_closed":
-            setStatus("disconnected");
-            break;
-
-          default:
-            break;
-        }
-      } catch (err) {
-        console.error("Failed to parse websocket message:", err);
+        const handle = await connectDirectGeminiLive(config, effectiveKey, callbacks);
+        sessionHandleRef.current = handle;
+        await startMicRecording(handle);
+      } catch (err: any) {
+        console.error("Direct live session failed:", err);
+        setStatus("error");
+        setErrorMessage(err?.message || "Failed to connect to Gemini Live");
       }
     };
 
-    ws.onerror = (err) => {
-      console.error("WebSocket error:", err);
-      setErrorMessage("WebSocket connection error");
-      setStatus("error");
-    };
-
-    ws.onclose = () => {
-      setStatus("disconnected");
-    };
-  }, [config, isMuted, status, interimGeminiText]);
+    // If configured for direct connection, or running on Vercel, connect direct
+    if (connectionMode === "direct" || isVercel) {
+      await tryDirectConnect();
+    } else {
+      // Attempt proxy first; automatically fallback to direct on failure
+      try {
+        const handle = await connectProxyWebSocket(config, callbacks);
+        sessionHandleRef.current = handle;
+        await startMicRecording(handle);
+      } catch (proxyErr) {
+        console.warn("WebSocket proxy failed, falling back to direct connection:", proxyErr);
+        if (effectiveKey) {
+          await tryDirectConnect();
+        } else {
+          setStatus("disconnected");
+          setIsSettingsOpen(true);
+          setErrorMessage(
+            "WebSocket proxy unavailable. Please enter your Gemini API key in Settings to connect directly."
+          );
+        }
+      }
+    }
+  }, [config, isMuted, userApiKey, backendApiKey, connectionMode, isVercel]);
 
   // Disconnect session
   const disconnectSession = useCallback(() => {
-    if (socketRef.current) {
-      socketRef.current.send(JSON.stringify({ type: "close" }));
-      socketRef.current.close();
-      socketRef.current = null;
+    if (sessionHandleRef.current) {
+      sessionHandleRef.current.close();
+      sessionHandleRef.current = null;
     }
     audioRecorderRef.current?.stop();
     audioPlayerRef.current?.interrupt();
@@ -304,22 +347,13 @@ export default function App() {
 
   // Send Video Frame
   const handleSendFrame = (base64Jpeg: string) => {
-    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-      socketRef.current.send(
-        JSON.stringify({
-          type: "video",
-          data: base64Jpeg,
-        })
-      );
-    }
+    sessionHandleRef.current?.sendVideo(base64Jpeg);
   };
 
   // Manual Interruption
   const handleInterrupt = () => {
     audioPlayerRef.current?.interrupt();
-    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-      socketRef.current.send(JSON.stringify({ type: "interrupt" }));
-    }
+    sessionHandleRef.current?.sendInterrupt();
     setStatus("interrupted");
     setInterimGeminiText("");
     setTimeout(() => {
@@ -339,14 +373,25 @@ export default function App() {
       },
     ]);
 
-    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-      socketRef.current.send(
-        JSON.stringify({
-          type: "text",
-          text,
-        })
-      );
-      setStatus("thinking");
+    sessionHandleRef.current?.sendText(text);
+    setStatus("thinking");
+  };
+
+  const handleSaveApiKey = (newKey: string) => {
+    setUserApiKey(newKey);
+    if (typeof window !== "undefined") {
+      localStorage.setItem("gemini_live_api_key", newKey);
+    }
+    if (newKey) {
+      setHasApiKey(true);
+      setErrorMessage(null);
+    }
+  };
+
+  const handleSaveConnectionMode = (mode: "direct" | "proxy") => {
+    setConnectionMode(mode);
+    if (typeof window !== "undefined") {
+      localStorage.setItem("gemini_live_connection_mode", mode);
     }
   };
 
@@ -359,7 +404,10 @@ export default function App() {
   }, [disconnectSession]);
 
   return (
-    <div id="gemini-live-app" className="relative w-screen h-screen bg-slate-950 text-white overflow-hidden select-none font-sans">
+    <div
+      id="gemini-live-app"
+      className="relative w-screen h-screen bg-slate-950 text-white overflow-hidden select-none font-sans"
+    >
       {/* Dynamic Background Aura */}
       <div className="absolute inset-0 pointer-events-none overflow-hidden opacity-30">
         <div
@@ -385,7 +433,10 @@ export default function App() {
       </div>
 
       {/* Top Navigation Bar */}
-      <header id="top-navbar" className="relative z-20 flex items-center justify-between px-6 py-4 border-b border-white/5 bg-slate-950/40 backdrop-blur-md">
+      <header
+        id="top-navbar"
+        className="relative z-20 flex items-center justify-between px-6 py-4 border-b border-white/5 bg-slate-950/40 backdrop-blur-md"
+      >
         {/* Brand identity */}
         <div className="flex items-center gap-3">
           <div className="flex items-center justify-center w-8 h-8 rounded-xl bg-gradient-to-tr from-indigo-600 via-purple-600 to-pink-500 shadow-md shadow-indigo-500/20">
@@ -395,8 +446,13 @@ export default function App() {
             <div className="flex items-center gap-2">
               <h1 className="text-sm font-bold tracking-tight text-white">Gemini Live</h1>
               <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-white/10 text-slate-300 font-medium border border-white/10">
-                Bidirectional Audio & Vision
+                Bidirectional Audio &amp; Vision
               </span>
+              {isVercel && (
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 font-medium border border-emerald-500/30 flex items-center gap-1">
+                  <Globe className="w-3 h-3" /> Vercel Live
+                </span>
+              )}
             </div>
             <p className="text-[11px] text-slate-400">Low-latency Gemini 3.8 Live API</p>
           </div>
@@ -465,21 +521,33 @@ export default function App() {
         </div>
       </header>
 
-      {/* API Key Missing Warning Banner */}
-      {!hasApiKey && (
-        <div id="missing-api-key-banner" className="relative z-20 px-4 py-2.5 bg-amber-950/40 border-b border-amber-500/20 text-amber-200 flex items-center justify-between text-xs backdrop-blur-md">
+      {/* Missing Key Notification on Vercel or when no key configured */}
+      {!hasApiKey && !userApiKey && (
+        <div
+          id="missing-api-key-banner"
+          className="relative z-20 px-4 py-2.5 bg-amber-950/50 border-b border-amber-500/30 text-amber-200 flex items-center justify-between text-xs backdrop-blur-md"
+        >
           <div className="flex items-center gap-2 max-w-2xl">
             <Key className="w-4 h-4 text-amber-400 shrink-0" />
             <span>
-              <strong>GEMINI_API_KEY</strong> is needed to establish live bidirectional sessions. Please add your key in <em>Settings &gt; Secrets</em>.
+              <strong>Gemini API Key Required:</strong> To talk with Gemini Live on Vercel, please click Settings to enter your key or set <code className="text-amber-100 bg-black/30 px-1 py-0.5 rounded">VITE_GEMINI_API_KEY</code>.
             </span>
           </div>
+          <button
+            onClick={() => setIsSettingsOpen(true)}
+            className="px-3 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 font-medium transition"
+          >
+            Enter Key
+          </button>
         </div>
       )}
 
       {/* Error Message Banner */}
       {errorMessage && (
-        <div id="error-message-banner" className="relative z-20 px-4 py-2 bg-rose-950/60 border-b border-rose-500/30 text-rose-200 flex items-center justify-between text-xs backdrop-blur-md">
+        <div
+          id="error-message-banner"
+          className="relative z-20 px-4 py-2 bg-rose-950/60 border-b border-rose-500/30 text-rose-200 flex items-center justify-between text-xs backdrop-blur-md"
+        >
           <div className="flex items-center gap-2">
             <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
             <span>{errorMessage}</span>
@@ -494,7 +562,10 @@ export default function App() {
       )}
 
       {/* Main Stage: Fluid Gemini Live Visualizer */}
-      <main id="live-stage" className="relative w-full h-[calc(100vh-140px)] flex items-center justify-center">
+      <main
+        id="live-stage"
+        className="relative w-full h-[calc(100vh-140px)] flex items-center justify-center"
+      >
         {/* Visualizer Canvas */}
         <LiveVisualizer
           status={status}
@@ -504,7 +575,7 @@ export default function App() {
           isMuted={isMuted}
         />
 
-        {/* Center Prompt / Greeting when Disconnected or Ready */}
+        {/* Center Prompt / Greeting when Disconnected */}
         {status === "disconnected" && (
           <div className="absolute z-10 flex flex-col items-center text-center p-6 max-w-md bg-slate-900/60 backdrop-blur-xl border border-white/10 rounded-3xl shadow-2xl animate-fade-in">
             <div className="w-14 h-14 rounded-2xl bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center mb-4 text-indigo-400">
@@ -597,6 +668,11 @@ export default function App() {
         config={config}
         onSaveConfig={(newConfig) => setConfig(newConfig)}
         isConnected={status !== "disconnected"}
+        apiKey={userApiKey}
+        onSaveApiKey={handleSaveApiKey}
+        connectionMode={connectionMode}
+        onSaveConnectionMode={handleSaveConnectionMode}
+        isVercel={isVercel}
       />
     </div>
   );
